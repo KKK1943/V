@@ -1,0 +1,6 @@
+{
+  "name": "Learn Anything",
+  "description": "An interactive AI-powered learning application that generates personalized study plans, lessons, and quizzes for any topic.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
