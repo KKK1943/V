@@ -60,6 +60,16 @@ class LearningViewModel(application: Application) : AndroidViewModel(application
         gamificationDao = database.gamificationDao()
     )
 
+    init {
+        viewModelScope.launch {
+            try {
+                repository.checkAndUpdateStreak()
+            } catch (e: Exception) {
+                Log.e("LearningViewModel", "Error updating daily streak on startup", e)
+            }
+        }
+    }
+
     // UI Tab State
     var selectedTab by mutableStateOf(AppTab.DISCOVER)
         private set

@@ -61,6 +61,63 @@ class LearningRepository(
         return cleaned.trim()
     }
 
+    private suspend fun <T> executeWithRetry(
+        maxRetries: Int = 3,
+        initialDelayMillis: Long = 1000,
+        factor: Double = 2.0,
+        block: suspend () -> T
+    ): T {
+        var currentDelay = initialDelayMillis
+        repeat(maxRetries - 1) { attempt ->
+            try {
+                return block()
+            } catch (e: retrofit2.HttpException) {
+                val code = e.code()
+                if (code == 429 || code == 503 || code == 500) {
+                    Log.w("LearningRepository", "API call failed with HTTP $code, retrying attempt ${attempt + 1}...")
+                    kotlinx.coroutines.delay(currentDelay)
+                    currentDelay = (currentDelay * factor).toLong()
+                } else {
+                    throw e
+                }
+            } catch (e: java.io.IOException) {
+                Log.w("LearningRepository", "API call failed with IO Exception, retrying attempt ${attempt + 1}...", e)
+                kotlinx.coroutines.delay(currentDelay)
+                currentDelay = (currentDelay * factor).toLong()
+            }
+        }
+        return block()
+    }
+
+    private suspend fun <T> safeApiCall(
+        operationName: String,
+        block: suspend () -> T
+    ): Result<T> {
+        return try {
+            val response = executeWithRetry {
+                block()
+            }
+            Result.success(response)
+        } catch (e: retrofit2.HttpException) {
+            Log.e("LearningRepository", "HTTP error in $operationName", e)
+            val code = e.code()
+            val userFriendlyMessage = when (code) {
+                400 -> "API Request Error (HTTP 400): The prompt generated an invalid request to Lumina AI. Please try a different topic."
+                403 -> "Invalid API Key (HTTP 403): Your Gemini API key is either incorrect, invalid, or has expired. Please check the Secrets Panel in AI Studio and make sure it has the correct permissions."
+                429 -> "Lumina AI is currently experiencing high demand (HTTP 429: Too Many Requests). We tried retrying automatically but the rate limits are still active. Please wait a few seconds and try again."
+                500, 503 -> "Lumina AI Server Busy (HTTP $code): The AI backend is temporarily overloaded or undergoing maintenance. Please try again in a moment."
+                else -> "Lumina AI Connection Error (HTTP $code): ${e.message()}"
+            }
+            Result.failure(Exception(userFriendlyMessage, e))
+        } catch (e: java.io.IOException) {
+            Log.e("LearningRepository", "Network IO error in $operationName", e)
+            Result.failure(Exception("Network Connectivity Issue: Unable to connect to Lumina AI servers. Please check your internet connection and try again.", e))
+        } catch (e: Exception) {
+            Log.e("LearningRepository", "Unexpected error in $operationName", e)
+            Result.failure(e)
+        }
+    }
+
     // 1. Generate overview and save a new Topic
     suspend fun createTopic(title: String): Result<TopicEntity> = withContext(Dispatchers.IO) {
         val apiKey = getApiKey()
@@ -68,30 +125,34 @@ class LearningRepository(
             return@withContext Result.failure(Exception("Gemini API Key is not configured. Please add GEMINI_API_KEY to your Secrets Panel."))
         }
 
-        val prompt = "You are an expert tutor. Provide a concise, highly engaging introduction to the topic '$title'. " +
-                "Include: 1) A brief summary, 2) Why it matters, and 3) A quick 'Did you know?' fun fact. " +
-                "Keep it within 180 words, styled beautifully with simple markdown bullets where appropriate."
+        val prompt = "You are an expert tutor. Provide a highly comprehensive, detailed, and full-length educational explanation/masterclass of the topic '$title'. " +
+                "Include:\n" +
+                "1) An in-depth complete overview and definition.\n" +
+                "2) Why this topic is critical to master, including real-world applications.\n" +
+                "3) Core key concepts, principles, or components detailed clearly.\n" +
+                "4) A step-by-step practical guide or example for complete beginners.\n" +
+                "5) A 'Did you know?' fun fact section.\n\n" +
+                "Do not summarize or keep it short. Make sure it is thorough, comprehensive, and educational. Style it beautifully with markdown headers (###), bold key terms, blockquotes, bullet points, and neat paragraph spacing."
 
         val request = GeminiRequest(
             contents = listOf(Content(parts = listOf(Part(text = prompt))))
         )
 
-        try {
-            val response = RetrofitInstance.apiService.generateContent(
+        val apiResult = safeApiCall("createTopic") {
+            RetrofitInstance.apiService.generateContent(
                 model = "gemini-3.5-flash",
                 apiKey = apiKey,
                 request = request
             )
+        }
 
+        apiResult.mapCatching { response ->
             val overviewText = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
                 ?: "No overview could be generated. Tap to learn and ask details!"
 
             val topic = TopicEntity(title = title, description = overviewText)
             val id = topicDao.insertTopic(topic)
-            Result.success(topic.copy(id = id.toInt()))
-        } catch (e: Exception) {
-            Log.e("LearningRepository", "Error creating topic", e)
-            Result.failure(e)
+            topic.copy(id = id.toInt())
         }
     }
 
@@ -134,13 +195,15 @@ class LearningRepository(
             )
         )
 
-        try {
-            val response = RetrofitInstance.apiService.generateContent(
-                model = "gemini-3.1-pro-preview",
+        val apiResult = safeApiCall("generateStudyPlan") {
+            RetrofitInstance.apiService.generateContent(
+                model = "gemini-3.5-flash",
                 apiKey = apiKey,
                 request = request
             )
+        }
 
+        apiResult.mapCatching { response ->
             val rawJson = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
                 ?: throw Exception("No study plan generated.")
 
@@ -178,10 +241,7 @@ class LearningRepository(
             }
 
             moduleDao.insertModules(modules)
-            Result.success(studyPlan.copy(id = planId))
-        } catch (e: Exception) {
-            Log.e("LearningRepository", "Error generating study plan", e)
-            Result.failure(e)
+            studyPlan.copy(id = planId)
         }
     }
 
@@ -218,13 +278,15 @@ class LearningRepository(
             )
         )
 
-        try {
-            val response = RetrofitInstance.apiService.generateContent(
-                model = "gemini-3.1-pro-preview",
+        val apiResult = safeApiCall("generateInteractiveLesson") {
+            RetrofitInstance.apiService.generateContent(
+                model = "gemini-3.5-flash",
                 apiKey = apiKey,
                 request = request
             )
+        }
 
+        apiResult.mapCatching { response ->
             val rawJson = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
                 ?: throw Exception("No lesson content generated.")
 
@@ -243,10 +305,7 @@ class LearningRepository(
             )
 
             moduleDao.updateModule(updatedModule)
-            Result.success(updatedModule)
-        } catch (e: Exception) {
-            Log.e("LearningRepository", "Error generating lesson", e)
-            Result.failure(e)
+            updatedModule
         }
     }
 
@@ -296,23 +355,21 @@ class LearningRepository(
             )
         )
 
-        try {
-            val response = RetrofitInstance.apiService.generateContent(
-                model = "gemini-3.1-pro-preview",
+        val apiResult = safeApiCall("askTopicQuestion") {
+            RetrofitInstance.apiService.generateContent(
+                model = "gemini-3.5-flash",
                 apiKey = apiKey,
                 request = request
             )
+        }
 
+        apiResult.mapCatching { response ->
             val aiResponse = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
                 ?: "I couldn't generate a response. Please ask again!"
 
             val modelMsg = ChatMessageEntity(topicId = topicId, role = "model", messageText = aiResponse)
             chatMessageDao.insertChatMessage(modelMsg)
-
-            Result.success(modelMsg)
-        } catch (e: Exception) {
-            Log.e("LearningRepository", "Error in chat", e)
-            Result.failure(e)
+            modelMsg
         }
     }
 
@@ -402,13 +459,15 @@ class LearningRepository(
             )
         )
 
-        try {
-            val response = RetrofitInstance.apiService.generateContent(
-                model = "gemini-3.1-pro-preview",
+        val apiResult = safeApiCall("generateProject") {
+            RetrofitInstance.apiService.generateContent(
+                model = "gemini-3.5-flash",
                 apiKey = apiKey,
                 request = request
             )
+        }
 
+        apiResult.mapCatching { response ->
             val rawJson = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
                 ?: throw Exception("No project generated.")
 
@@ -430,10 +489,7 @@ class LearningRepository(
             )
 
             val projectId = projectDao.insertProject(project).toInt()
-            Result.success(project.copy(id = projectId))
-        } catch (e: Exception) {
-            Log.e("LearningRepository", "Error generating project", e)
-            Result.failure(e)
+            project.copy(id = projectId)
         }
     }
 
@@ -472,13 +528,15 @@ class LearningRepository(
             )
         )
 
-        try {
-            val response = RetrofitInstance.apiService.generateContent(
-                model = "gemini-3.1-pro-preview",
+        val apiResult = safeApiCall("askProjectQuestion") {
+            RetrofitInstance.apiService.generateContent(
+                model = "gemini-3.5-flash",
                 apiKey = apiKey,
                 request = request
             )
+        }
 
+        apiResult.mapCatching { response ->
             val aiResponse = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
                 ?: "I am here to support you! Let me know which step you are working on."
 
@@ -491,11 +549,7 @@ class LearningRepository(
 
             val updatedProject = project.copy(assistantChatJson = chatArray.toString())
             projectDao.updateProject(updatedProject)
-
-            Result.success(updatedProject)
-        } catch (e: Exception) {
-            Log.e("LearningRepository", "Error in project assistant chat", e)
-            Result.failure(e)
+            updatedProject
         }
     }
 
@@ -618,6 +672,44 @@ class LearningRepository(
         gamificationDao.insertProfile(updated)
     }
 
+    suspend fun checkAndUpdateStreak() = withContext(Dispatchers.IO) {
+        val profile = gamificationDao.getProfileSync() ?: GamificationProfileEntity(id = 1)
+        val currentTime = System.currentTimeMillis()
+        val lastActive = profile.lastActiveTimestamp
+        val currentStreak = profile.streakCount
+
+        if (currentStreak == 0) {
+            val updated = profile.copy(
+                streakCount = 1,
+                lastActiveTimestamp = currentTime
+            )
+            gamificationDao.insertProfile(updated)
+            return@withContext
+        }
+
+        val calLast = java.util.Calendar.getInstance().apply { timeInMillis = lastActive }
+        val calCurrent = java.util.Calendar.getInstance().apply { timeInMillis = currentTime }
+
+        val isSameDay = calLast.get(java.util.Calendar.YEAR) == calCurrent.get(java.util.Calendar.YEAR) &&
+                calLast.get(java.util.Calendar.DAY_OF_YEAR) == calCurrent.get(java.util.Calendar.DAY_OF_YEAR)
+
+        calCurrent.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        val isYesterday = calLast.get(java.util.Calendar.YEAR) == calCurrent.get(java.util.Calendar.YEAR) &&
+                calLast.get(java.util.Calendar.DAY_OF_YEAR) == calCurrent.get(java.util.Calendar.DAY_OF_YEAR)
+
+        val newStreak = when {
+            isSameDay -> currentStreak
+            isYesterday -> currentStreak + 1
+            else -> 1 // missed a day, reset streak to 1
+        }
+
+        val updated = profile.copy(
+            streakCount = newStreak,
+            lastActiveTimestamp = currentTime
+        )
+        gamificationDao.insertProfile(updated)
+    }
+
     suspend fun claimPrize(prizeId: String) = withContext(Dispatchers.IO) {
         val profile = gamificationDao.getProfileSync() ?: GamificationProfileEntity(id = 1)
         val prizes = try {
@@ -681,13 +773,15 @@ class LearningRepository(
             )
         )
 
-        try {
-            val response = RetrofitInstance.apiService.generateContent(
-                model = "gemini-3.1-pro-preview",
+        val apiResult = safeApiCall("generateDailyVideos") {
+            RetrofitInstance.apiService.generateContent(
+                model = "gemini-3.5-flash",
                 apiKey = apiKey,
                 request = request
             )
+        }
 
+        apiResult.mapCatching { response ->
             val rawJson = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
                 ?: throw Exception("No daily videos generated.")
 
@@ -698,10 +792,7 @@ class LearningRepository(
             val updated = profile.copy(dailyVideosJson = cleanJson)
             gamificationDao.insertProfile(updated)
 
-            Result.success(cleanJson)
-        } catch (e: Exception) {
-            Log.e("LearningRepository", "Error generating daily videos", e)
-            Result.failure(e)
+            cleanJson
         }
     }
 }

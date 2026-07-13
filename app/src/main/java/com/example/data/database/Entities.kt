@@ -90,7 +90,7 @@ data class GamificationProfileEntity(
     val badgesJson: String = "[]", // JSON array of earned badge titles
     val gmail: String? = null,
     val age: Int? = null,
-    val streakCount: Int = 12,
+    val streakCount: Int = 0,
     val lastActiveTimestamp: Long = System.currentTimeMillis(),
     val dailyVideosJson: String = "[]", // JSON containing daily video tasks and quizzes
     val claimedPrizesJson: String = "[]" // JSON array of unlocked/claimed rewards
